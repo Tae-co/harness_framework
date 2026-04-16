@@ -226,6 +226,45 @@ class StepExecutor:
 
     # --- Claude 호출 ---
 
+    def _review_step(self, step: dict) -> Optional[str]:
+        """완료된 step의 규칙 위반 여부를 검토한다. 위반 있으면 문자열, 없으면 None."""
+        step_num = step["step"]
+        step_file = self._phase_dir / f"step{step_num}.md"
+        if not step_file.exists():
+            return None
+
+        step_content = step_file.read_text()
+        modified = self._run_git("diff", "HEAD", "--name-only").stdout.strip()
+        staged = self._run_git("diff", "--cached", "--name-only").stdout.strip()
+        untracked = self._run_git("ls-files", "--others", "--exclude-standard").stdout.strip()
+        all_changed = "\n".join(filter(None, [modified, staged, untracked])) or "(변경 없음)"
+
+        claude_md = ROOT / "CLAUDE.md"
+        rules = claude_md.read_text() if claude_md.exists() else ""
+
+        review_prompt = (
+            f"방금 실행된 step을 규칙 준수 여부 관점에서 검토하라.\n\n"
+            f"## Step 지시사항\n\n{step_content}\n\n"
+            f"## 실제로 변경된 파일\n\n{all_changed}\n\n"
+            f"## 프로젝트 규칙 (CLAUDE.md)\n\n{rules}\n\n"
+            f"## 검토 기준\n\n"
+            f"1. step 지시사항의 범위를 벗어난 파일을 수정했는가?\n"
+            f"2. 새 기능/로직 추가 시 테스트가 함께 작성됐는가?\n"
+            f"3. CLAUDE.md의 CRITICAL 규칙을 위반했는가?\n\n"
+            f"위반이 없으면 정확히 'OK'만 출력하라.\n"
+            f"위반이 있으면 항목별로 간결하게 나열하라. 'OK'를 포함하지 마라."
+        )
+
+        result = subprocess.run(
+            ["claude", "-p", "--dangerously-skip-permissions", review_prompt],
+            cwd=self._root, capture_output=True, text=True, timeout=300,
+        )
+
+        output = result.stdout.strip()
+        if not output or output.upper() == "OK":
+            return None
+        return f"[규칙 위반 감지]\n{output}"
+
     def _invoke_claude(self, step: dict, preamble: str) -> dict:
         step_num, step_name = step["step"], step["name"]
         step_file = self._phase_dir / f"step{step_num}.md"
@@ -307,19 +346,33 @@ class StepExecutor:
 
             with progress_indicator(tag) as pi:
                 self._invoke_claude(step, preamble)
-                elapsed = int(pi.elapsed)
+            elapsed = int(pi.elapsed)
 
             index = self._read_json(self._index_file)
             status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
             ts = self._stamp()
 
             if status == "completed":
+                with progress_indicator(f"Step {step_num} 규칙 검토") as _:
+                    violations = self._review_step(step)
+
+                if violations and attempt < self.MAX_RETRIES:
+                    for s in index["steps"]:
+                        if s["step"] == step_num:
+                            s["status"] = "pending"
+                            s.pop("error_message", None)
+                    self._write_json(self._index_file, index)
+                    prev_error = violations
+                    print(f"  ⚠ Step {step_num}: 규칙 위반 감지 — 재시도 {attempt}/{self.MAX_RETRIES}")
+                    continue
+
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["completed_at"] = ts
                 self._write_json(self._index_file, index)
                 self._commit_step(step_num, step_name)
-                print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]")
+                warn = " ⚠ 위반사항 있음" if violations else ""
+                print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]{warn}")
                 return True
 
             if status == "blocked":

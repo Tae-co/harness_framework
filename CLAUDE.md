@@ -15,7 +15,7 @@
 - 커밋 메시지는 conventional commits 형식을 따를 것 (feat:, fix:, docs:, refactor:)
 
 ## 명령어
-npm run dev      # 개발 서버
-npm run build    # 프로덕션 빌드
-npm run lint     # ESLint
-npm run test     # 테스트
+{개발 서버 커맨드}   # 예: npm run dev / ./gradlew bootRun / flutter run
+{빌드 커맨드}       # 예: npm run build / ./gradlew build / flutter build
+{린트 커맨드}       # 예: npm run lint / ./gradlew checkstyleMain / flutter analyze
+{테스트 커맨드}     # 예: npm test / ./gradlew test / flutter test

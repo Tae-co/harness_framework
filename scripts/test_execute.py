@@ -557,3 +557,76 @@ class TestCheckBlockers:
         with pytest.raises(SystemExit) as exc_info:
             inst._check_blockers()
         assert exc_info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# _review_step
+# ---------------------------------------------------------------------------
+
+class TestReviewStep:
+    def test_ok_output_returns_none(self, executor):
+        mock_result = MagicMock(returncode=0, stdout="OK", stderr="")
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+
+        with patch("subprocess.run", return_value=mock_result):
+            result = executor._review_step({"step": 2, "name": "ui"})
+
+        assert result is None
+
+    def test_violation_returns_formatted_string(self, executor):
+        mock_result = MagicMock(returncode=0, stdout="테스트 없이 기능 추가됨", stderr="")
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+
+        with patch("subprocess.run", return_value=mock_result):
+            result = executor._review_step({"step": 2, "name": "ui"})
+
+        assert result is not None
+        assert "[규칙 위반 감지]" in result
+        assert "테스트 없이 기능 추가됨" in result
+
+    def test_empty_output_returns_none(self, executor):
+        mock_result = MagicMock(returncode=0, stdout="", stderr="")
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+
+        with patch("subprocess.run", return_value=mock_result):
+            result = executor._review_step({"step": 2, "name": "ui"})
+
+        assert result is None
+
+    def test_missing_step_file_returns_none(self, executor):
+        result = executor._review_step({"step": 99, "name": "nonexistent"})
+        assert result is None
+
+    def test_prompt_includes_step_content(self, executor):
+        mock_result = MagicMock(returncode=0, stdout="OK", stderr="")
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            executor._review_step({"step": 2, "name": "ui"})
+
+        prompt = mock_run.call_args[0][0][-1]
+        assert "UI를 구현하세요" in prompt
+
+    def test_prompt_includes_changed_files(self, executor):
+        mock_result = MagicMock(returncode=0, stdout="OK", stderr="")
+        git_responses = [
+            MagicMock(returncode=0, stdout="src/Foo.java\n", stderr=""),
+            MagicMock(returncode=0, stdout="", stderr=""),
+            MagicMock(returncode=0, stdout="", stderr=""),
+        ]
+        executor._run_git = MagicMock(side_effect=git_responses)
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            executor._review_step({"step": 2, "name": "ui"})
+
+        prompt = mock_run.call_args[0][0][-1]
+        assert "src/Foo.java" in prompt
+
+    def test_timeout_is_300(self, executor):
+        mock_result = MagicMock(returncode=0, stdout="OK", stderr="")
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            executor._review_step({"step": 2, "name": "ui"})
+
+        assert mock_run.call_args[1]["timeout"] == 300
