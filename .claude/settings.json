@@ -18,6 +18,25 @@
           {
             "type": "command",
             "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'rm\\s+-rf|git\\s+push\\s+--force|git\\s+reset\\s+--hard|DROP\\s+TABLE'; then echo 'BLOCKED: 위험한 명령어가 감지되었습니다.' >&2; exit 1; fi"
+          },
+          {
+            "type": "command",
+            "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'git\\s+commit'; then ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd); ACTIVE=$(ls \"$ROOT/plans/active/\"*.md 2>/dev/null); COMPLETED=$(ls \"$ROOT/plans/completed/\"*.md 2>/dev/null); if [ -z \"$ACTIVE\" ] && [ -z \"$COMPLETED\" ]; then echo 'BLOCKED: plans/ 에 플랜 파일이 없습니다. /harness 를 먼저 실행하세요.' >&2; exit 1; fi; fi"
+          },
+          {
+            "type": "command",
+            "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'git\\s+commit'; then BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); if [ \"$BRANCH\" = \"main\" ] || [ \"$BRANCH\" = \"master\" ]; then echo 'BLOCKED: main/master 브랜치에 직접 커밋할 수 없습니다. feat- 브랜치를 사용하세요.' >&2; exit 1; fi; fi"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('file_path',''))\" 2>/dev/null); if echo \"$FILE\" | grep -qE '\\.(ts|tsx|js|jsx|py|java|kt|swift)$' && ! echo \"$FILE\" | grep -qE '(test|spec|__tests__)'; then BASENAME=$(basename \"$FILE\" | sed 's/\\.[^.]*$//'); DIR=$(dirname \"$FILE\"); if ! find \"$DIR\" -name \"*${BASENAME}*\" | grep -qE '(test|spec|__tests__)'; then echo \"WARN: 테스트 파일이 감지되지 않았습니다 — ${FILE}. TDD 원칙에 따라 테스트를 먼저 작성하세요.\" >&2; fi; fi"
           }
         ]
       }
