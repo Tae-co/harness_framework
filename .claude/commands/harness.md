@@ -12,9 +12,36 @@
 
 구현을 위해 구체화하거나 기술적으로 결정해야 할 사항이 있으면 사용자에게 제시하고 논의한다.
 
-### C. Step 설계
+### C. Plan 작성
 
-사용자가 구현 계획 작성을 지시하면 여러 step으로 나뉜 초안을 작성해 피드백을 요청한다.
+논의가 끝나면 `plans/active/{task-name}.md`를 생성한다. task-name은 kebab-case로 작업을 한두 단어로 표현한다 (예: `user-auth`, `payment-flow`).
+
+파일 구조:
+
+```markdown
+# Plan: {task-name}
+
+## 목표
+{이 작업이 해결하는 문제를 한 줄로}
+
+## 범위
+{무엇을 만드는지 — 기능 목록}
+
+## 제외
+{이번 작업에서 하지 않는 것}
+
+## 접근 방식
+{어떻게 구현할지 — 핵심 기술 결정}
+
+## 예상 Step 수
+{N개}
+```
+
+파일을 생성한 후 사용자에게 보여주고 승인을 요청한다. **승인 전까지 다음 단계로 넘어가지 않는다.**
+
+### D. Step 설계
+
+사용자가 승인하면 여러 step으로 나뉜 구현 계획을 작성한다.
 
 설계 원칙:
 
@@ -26,11 +53,9 @@
 6. **주의사항은 구체적으로** — "조심해라" 대신 "X를 하지 마라. 이유: Y" 형식으로 적는다.
 7. **네이밍** — step name은 kebab-case slug로, 해당 step의 핵심 모듈/작업을 한두 단어로 표현한다 (예: `project-setup`, `api-layer`, `auth-flow`).
 
-### D. 파일 생성
+### E. 파일 생성
 
-사용자가 승인하면 아래 파일들을 생성한다.
-
-#### D-1. `phases/index.json` (전체 현황)
+#### E-1. `phases/index.json` (전체 현황)
 
 여러 task를 관리하는 top-level 인덱스. 이미 존재하면 `phases` 배열에 새 항목을 추가한다.
 
@@ -38,7 +63,7 @@
 {
   "phases": [
     {
-      "dir": "0-mvp",
+      "dir": "user-auth",
       "status": "pending"
     }
   ]
@@ -49,7 +74,7 @@
 - `status`: `"pending"` | `"completed"` | `"error"` | `"blocked"`. execute.py가 실행 중 자동으로 업데이트한다.
 - 타임스탬프(`completed_at`, `failed_at`, `blocked_at`)는 execute.py가 상태 변경 시 자동 기록한다. 생성 시 넣지 않는다.
 
-#### D-2. `phases/{task-name}/index.json` (task 상세)
+#### E-2. `phases/{task-name}/index.json` (task 상세)
 
 ```json
 {
@@ -83,7 +108,7 @@
 
 `created_at`은 execute.py가 최초 실행 시 task 레벨에 한 번만 기록한다. step 레벨의 `started_at`도 execute.py가 각 step 시작 시 자동 기록한다. 생성 시 넣지 않는다.
 
-#### D-3. `phases/{task-name}/step{N}.md` (각 step마다 1개)
+#### E-3. `phases/{task-name}/step{N}.md` (각 step마다 1개)
 
 ```markdown
 # Step {N}: {이름}
@@ -129,11 +154,20 @@
 - 기존 테스트를 깨뜨리지 마라
 ```
 
-### E. 실행
+### F. 실행
+
+파일 생성이 완료되면 즉시 아래 커맨드를 실행한다. 사용자에게 별도 확인을 요청하지 않는다.
 
 ```bash
-python3 scripts/execute.py {task-name}        # 순차 실행
-python3 scripts/execute.py {task-name} --push  # 실행 후 push
+python3 scripts/execute.py {task-name}         # 순차 실행 후 종료
+python3 scripts/execute.py {task-name} --push  # 실행 후 feat-{task-name} 브랜치를 origin에 push
+```
+
+실행 완료 후 로그 확인:
+
+```bash
+python3 scripts/show_logs.py           # 전체 phase 요약
+python3 scripts/show_logs.py {task-name}  # 이번 phase 상세
 ```
 
 execute.py가 자동으로 처리하는 것:
@@ -142,8 +176,12 @@ execute.py가 자동으로 처리하는 것:
 - 가드레일 주입 — CLAUDE.md + docs/*.md 내용을 매 step 프롬프트에 포함
 - 컨텍스트 누적 — 완료된 step의 summary를 다음 step 프롬프트에 전달
 - 자가 교정 — 실패 시 최대 3회 재시도하며, 이전 에러 메시지를 프롬프트에 피드백
+- 규칙 위반 감지 — step 완료 후 별도 세션이 CLAUDE.md 규칙 준수 여부를 검토
+- circuit breaker — 동일 에러 2회 연속 시 무한루프 탈출
+- plan 이동 — phase 완료 시 `plans/active/{task-name}.md` → `plans/completed/`로 자동 이동
 - 2단계 커밋 — 코드 변경(`feat`)과 메타데이터(`chore`)를 분리 커밋
 - 타임스탬프 — started_at, completed_at, failed_at, blocked_at 자동 기록
+- 규칙 진화 — phase 완료 후 위반 이력을 분석해 CLAUDE.md CRITICAL 규칙을 자동 추가
 
 에러 복구:
 

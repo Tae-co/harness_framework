@@ -26,3 +26,22 @@
 | 빌드 가능 | ✅/❌ | {상세} |
 
 위반 사항이 있으면 수정 방안을 구체적으로 제시하라.
+
+## 위반 기록
+
+위반사항이 하나라도 있으면 아래 형식의 JSON 파일을 `logs/manual-review/` 디렉토리에 생성하라.
+파일명: `review-{YYYYMMDD-HHMMSS}.json` (예: `review-20260418-143022.json`)
+
+```json
+{
+  "timestamp": "{현재 ISO 8601 시각, 예: 2026-04-18T14:30:22+0900}",
+  "phase": "manual-review",
+  "step": 0,
+  "name": "manual",
+  "status": "completed_with_violations",
+  "violations": "{위반 항목을 줄바꿈으로 구분해 한 문자열로}"
+}
+```
+
+이 파일은 execute.py 실행 시 guardrails에 자동으로 포함되어, AI가 동일한 실수를 반복하지 않도록 피드백된다.
+위반사항이 없으면 이 파일을 생성하지 않는다.

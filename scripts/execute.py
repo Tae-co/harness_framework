@@ -8,8 +8,8 @@ Usage:
 
 import argparse
 import contextlib
+import fnmatch
 import json
-import os
 import subprocess
 import sys
 import threading
@@ -57,6 +57,10 @@ class StepExecutor:
     FEAT_MSG = "feat({phase}): step {num} — {name}"
     CHORE_MSG = "chore({phase}): step {num} output"
     TZ = timezone(timedelta(hours=9))
+    SENSITIVE_PATTERNS = [
+        ".env", ".env.*", "*.key", "*.pem", "*.p12", "*.pfx",
+        "*credentials*", "*secrets*", "*.secret",
+    ]
 
     def __init__(self, phase_dir_name: str, *, auto_push: bool = False):
         self._root = str(ROOT)
@@ -88,6 +92,8 @@ class StepExecutor:
         self._ensure_created_at()
         self._execute_all_steps(guardrails)
         self._finalize()
+        self._move_plan_to_completed()
+        self._evolve_rules()
 
     # --- timestamps ---
 
@@ -133,11 +139,20 @@ class StepExecutor:
 
         print(f"  Branch: {branch}")
 
+    def _unstage_sensitive_files(self):
+        result = self._run_git("diff", "--cached", "--name-only")
+        for f in result.stdout.strip().splitlines():
+            basename = Path(f).name
+            if any(fnmatch.fnmatch(basename, pat) for pat in self.SENSITIVE_PATTERNS):
+                self._run_git("reset", "HEAD", "--", f)
+                print(f"  WARN: 민감 파일 스테이징 제외: {f}")
+
     def _commit_step(self, step_num: int, step_name: str):
         output_rel = f"phases/{self._phase_dir_name}/step{step_num}-output.json"
         index_rel = f"phases/{self._phase_dir_name}/index.json"
 
         self._run_git("add", "-A")
+        self._unstage_sensitive_files()
         self._run_git("reset", "HEAD", "--", output_rel)
         self._run_git("reset", "HEAD", "--", index_rel)
 
@@ -150,6 +165,7 @@ class StepExecutor:
                 print(f"  WARN: 코드 커밋 실패: {r.stderr.strip()}")
 
         self._run_git("add", "-A")
+        self._unstage_sensitive_files()
         if self._run_git("diff", "--cached", "--quiet").returncode != 0:
             msg = self.CHORE_MSG.format(phase=self._phase_name, num=step_num)
             r = self._run_git("commit", "-m", msg)
@@ -183,7 +199,49 @@ class StepExecutor:
         if docs_dir.is_dir():
             for doc in sorted(docs_dir.glob("*.md")):
                 sections.append(f"## {doc.stem}\n\n{doc.read_text()}")
+        violations_history = self._load_recent_violations()
+        if violations_history:
+            sections.append(violations_history)
         return "\n\n---\n\n".join(sections) if sections else ""
+
+    def _load_recent_violations(self) -> str:
+        logs_dir = ROOT / "logs"
+        if not logs_dir.exists():
+            return ""
+        entries = []
+        for log_file in logs_dir.glob("*/*.json"):
+            try:
+                data = json.loads(log_file.read_text(encoding="utf-8"))
+                if data.get("violations"):
+                    entries.append(data)
+            except Exception:
+                continue
+        if not entries:
+            return ""
+        entries.sort(key=lambda d: d.get("timestamp", ""))
+        lines = [
+            f"- [{d.get('timestamp', '')[:10]}] {d.get('phase', '')} {d.get('name', '')}: {d['violations']}"
+            for d in entries[-10:]
+        ]
+        return "## 과거 규칙 위반 이력 (동일한 실수를 반복하지 마라)\n\n" + "\n".join(lines)
+
+    def _write_step_log(self, step_num: int, step_name: str, status: str,
+                        violations: Optional[str] = None, error: Optional[str] = None):
+        log_dir = ROOT / "logs" / self._phase_dir_name
+        log_dir.mkdir(parents=True, exist_ok=True)
+        entry: dict = {
+            "timestamp": self._stamp(),
+            "phase": self._phase_dir_name,
+            "step": step_num,
+            "name": step_name,
+            "status": status,
+        }
+        if violations:
+            entry["violations"] = violations
+        if error:
+            entry["error"] = error
+        log_file = log_dir / f"step{step_num}.json"
+        log_file.write_text(json.dumps(entry, indent=2, ensure_ascii=False), encoding="utf-8")
 
     @staticmethod
     def _build_step_context(index: dict) -> str:
@@ -290,8 +348,7 @@ class StepExecutor:
             "stdout": result.stdout, "stderr": result.stderr,
         }
         out_path = self._phase_dir / f"step{step_num}-output.json"
-        with open(out_path, "w") as f:
-            json.dump(output, f, indent=2, ensure_ascii=False)
+        out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
 
         return output
 
@@ -334,6 +391,8 @@ class StepExecutor:
         step_num, step_name = step["step"], step["name"]
         done = sum(1 for s in self._read_json(self._index_file)["steps"] if s["status"] == "completed")
         prev_error = None
+        last_error = None
+        same_error_count = 0
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             index = self._read_json(self._index_file)
@@ -370,6 +429,9 @@ class StepExecutor:
                     if s["step"] == step_num:
                         s["completed_at"] = ts
                 self._write_json(self._index_file, index)
+                self._write_step_log(step_num, step_name,
+                                     "completed_with_violations" if violations else "completed",
+                                     violations=violations)
                 self._commit_step(step_num, step_name)
                 warn = " ⚠ 위반사항 있음" if violations else ""
                 print(f"  ✓ Step {step_num}: {step_name} [{elapsed}s]{warn}")
@@ -392,6 +454,25 @@ class StepExecutor:
             )
 
             if attempt < self.MAX_RETRIES:
+                # circuit breaker: 동일 에러 2회 연속 시 중단
+                if err_msg == last_error:
+                    same_error_count += 1
+                else:
+                    same_error_count = 1
+                    last_error = err_msg
+
+                if same_error_count >= 2:
+                    for s in index["steps"]:
+                        if s["step"] == step_num:
+                            s["status"] = "error"
+                            s["error_message"] = f"[circuit breaker] 동일 에러 반복: {err_msg}"
+                            s["failed_at"] = self._stamp()
+                    self._write_json(self._index_file, index)
+                    print(f"  ✗ Step {step_num}: circuit breaker 발동 — 동일 에러 {same_error_count}회 반복")
+                    print(f"    Error: {err_msg}")
+                    self._update_top_index("error")
+                    sys.exit(1)
+
                 for s in index["steps"]:
                     if s["step"] == step_num:
                         s["status"] = "pending"
@@ -406,6 +487,7 @@ class StepExecutor:
                         s["error_message"] = f"[{self.MAX_RETRIES}회 시도 후 실패] {err_msg}"
                         s["failed_at"] = ts
                 self._write_json(self._index_file, index)
+                self._write_step_log(step_num, step_name, "error", error=err_msg)
                 self._commit_step(step_num, step_name)
                 print(f"  ✗ Step {step_num}: {step_name} failed after {self.MAX_RETRIES} attempts [{elapsed}s]")
                 print(f"    Error: {err_msg}")
@@ -438,6 +520,7 @@ class StepExecutor:
         self._update_top_index("completed")
 
         self._run_git("add", "-A")
+        self._unstage_sensitive_files()
         if self._run_git("diff", "--cached", "--quiet").returncode != 0:
             msg = f"chore({self._phase_name}): mark phase completed"
             r = self._run_git("commit", "-m", msg)
@@ -455,6 +538,102 @@ class StepExecutor:
         print(f"\n{'='*60}")
         print(f"  Phase '{self._phase_name}' completed!")
         print(f"{'='*60}")
+
+    def _move_plan_to_completed(self):
+        plans_active = ROOT / "plans" / "active"
+        plans_completed = ROOT / "plans" / "completed"
+        plan_file = plans_active / f"{self._phase_dir_name}.md"
+
+        if not plan_file.exists():
+            return
+
+        plans_completed.mkdir(parents=True, exist_ok=True)
+        dest = plans_completed / f"{self._phase_dir_name}.md"
+        plan_file.rename(dest)
+
+        self._run_git("add", "-A")
+        if self._run_git("diff", "--cached", "--quiet").returncode != 0:
+            self._run_git("commit", "-m", f"chore({self._phase_name}): move plan to completed")
+
+        print(f"  ✓ Plan moved to plans/completed/{self._phase_dir_name}.md")
+
+    def _evolve_rules(self):
+        """이번 phase 위반 이력을 분석해 CLAUDE.md에 새 CRITICAL 규칙을 자동 추가한다."""
+        log_dir = ROOT / "logs" / self._phase_dir_name
+        if not log_dir.exists():
+            return
+
+        violations = []
+        for log_file in sorted(log_dir.glob("*.json")):
+            try:
+                data = json.loads(log_file.read_text(encoding="utf-8"))
+                if data.get("violations"):
+                    violations.append(f"- step{data['step']} ({data['name']}): {data['violations']}")
+            except Exception:
+                continue
+
+        if not violations:
+            return
+
+        claude_md = ROOT / "CLAUDE.md"
+        if not claude_md.exists():
+            return
+
+        current_rules = claude_md.read_text(encoding="utf-8")
+
+        prompt = (
+            f"아래는 이번 phase에서 발생한 규칙 위반 목록이다:\n\n"
+            + "\n".join(violations)
+            + f"\n\n아래는 현재 프로젝트 규칙 파일(CLAUDE.md)이다:\n\n{current_rules}\n\n"
+            f"위반 패턴을 분석해서 향후 동일한 실수가 반복되지 않도록 "
+            f"CLAUDE.md의 '## CRITICAL 규칙' 섹션에 추가할 새 규칙을 제안하라.\n\n"
+            f"조건:\n"
+            f"- 이미 존재하는 규칙과 중복되면 제안하지 마라.\n"
+            f"- '코드를 잘 작성하라' 같은 너무 일반적인 규칙은 제안하지 마라.\n"
+            f"- 위반 패턴에서 직접 도출되는 구체적인 규칙만 제안하라.\n\n"
+            f"새 규칙이 없으면 정확히 'NONE'만 출력하라.\n"
+            f"새 규칙이 있으면 아래 형식으로만 출력하라 (설명 없이):\n"
+            f"- CRITICAL: {{규칙 내용}}\n"
+        )
+
+        with progress_indicator("규칙 진화 분석") as _:
+            result = subprocess.run(
+                ["claude", "-p", "--dangerously-skip-permissions", prompt],
+                cwd=self._root, capture_output=True, text=True, timeout=300,
+            )
+
+        output = result.stdout.strip()
+        if not output or output.upper() == "NONE":
+            print("  ✓ 추가할 새 규칙 없음")
+            return
+
+        new_rules = [
+            line.strip() for line in output.splitlines()
+            if line.strip().startswith("- CRITICAL:")
+        ]
+        if not new_rules:
+            return
+
+        lines = current_rules.splitlines()
+        insert_idx = len(lines)
+        in_critical = False
+        for i, line in enumerate(lines):
+            if line.strip() == "## CRITICAL 규칙":
+                in_critical = True
+            elif in_critical and line.startswith("##"):
+                insert_idx = i
+                break
+
+        lines[insert_idx:insert_idx] = new_rules
+        claude_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        self._run_git("add", "CLAUDE.md")
+        if self._run_git("diff", "--cached", "--quiet").returncode != 0:
+            self._run_git("commit", "-m", f"chore({self._phase_name}): evolve harness rules")
+
+        print(f"  ✓ CLAUDE.md에 {len(new_rules)}개 규칙 추가:")
+        for rule in new_rules:
+            print(f"    {rule}")
 
 
 def main():
