@@ -400,15 +400,15 @@ class TestCommitStep:
         assert "chore(mvp):" in commit_calls[1][2]
 
     def test_no_code_changes_skips_feat_commit(self, executor):
-        call_count = {"diff": 0}
         calls = []
         def fake_git(*args):
             calls.append(args)
+            if args[:2] == ("diff", "--cached") and "--quiet" in args:
+                # 첫 번째 --quiet 체크(feat): 변경 없음(0=no diff), 두 번째(chore): 변경 있음(1=has diff)
+                quiet_calls = [c for c in calls if c[:2] == ("diff", "--cached") and "--quiet" in c]
+                return MagicMock(returncode=0 if len(quiet_calls) == 1 else 1)
             if args[:2] == ("diff", "--cached"):
-                call_count["diff"] += 1
-                if call_count["diff"] == 1:
-                    return MagicMock(returncode=0)
-                return MagicMock(returncode=1)
+                return MagicMock(returncode=0, stdout="", stderr="")
             return MagicMock(returncode=0, stdout="", stderr="")
         executor._run_git = fake_git
 
@@ -630,3 +630,412 @@ class TestReviewStep:
             executor._review_step({"step": 2, "name": "ui"})
 
         assert mock_run.call_args[1]["timeout"] == 300
+
+
+# ---------------------------------------------------------------------------
+# _write_step_log
+# ---------------------------------------------------------------------------
+
+class TestWriteStepLog:
+    def test_creates_log_file(self, executor, tmp_project):
+        with patch.object(ex, "ROOT", tmp_project):
+            executor._write_step_log(2, "ui", "completed")
+        assert (tmp_project / "logs" / "0-mvp" / "step2.json").exists()
+
+    def test_log_contains_required_fields(self, executor, tmp_project):
+        with patch.object(ex, "ROOT", tmp_project):
+            executor._write_step_log(2, "ui", "completed")
+        data = json.loads((tmp_project / "logs" / "0-mvp" / "step2.json").read_text())
+        assert data["phase"] == "0-mvp"
+        assert data["step"] == 2
+        assert data["name"] == "ui"
+        assert data["status"] == "completed"
+        assert "timestamp" in data
+
+    def test_violations_included_when_provided(self, executor, tmp_project):
+        with patch.object(ex, "ROOT", tmp_project):
+            executor._write_step_log(2, "ui", "completed_with_violations", violations="테스트 파일 없음")
+        data = json.loads((tmp_project / "logs" / "0-mvp" / "step2.json").read_text())
+        assert data["violations"] == "테스트 파일 없음"
+
+    def test_error_included_when_provided(self, executor, tmp_project):
+        with patch.object(ex, "ROOT", tmp_project):
+            executor._write_step_log(2, "ui", "error", error="빌드 실패")
+        data = json.loads((tmp_project / "logs" / "0-mvp" / "step2.json").read_text())
+        assert data["error"] == "빌드 실패"
+
+    def test_no_extra_keys_when_optional_args_absent(self, executor, tmp_project):
+        with patch.object(ex, "ROOT", tmp_project):
+            executor._write_step_log(2, "ui", "completed")
+        data = json.loads((tmp_project / "logs" / "0-mvp" / "step2.json").read_text())
+        assert "violations" not in data
+        assert "error" not in data
+
+    def test_creates_parent_directories(self, executor, tmp_project):
+        with patch.object(ex, "ROOT", tmp_project):
+            executor._write_step_log(2, "ui", "completed")
+        assert (tmp_project / "logs" / "0-mvp").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# _load_recent_violations
+# ---------------------------------------------------------------------------
+
+class TestLoadRecentViolations:
+    def test_returns_empty_when_no_logs_dir(self, executor, tmp_project):
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_recent_violations()
+        assert result == ""
+
+    def test_returns_empty_when_no_violations(self, executor, tmp_project):
+        log_dir = tmp_project / "logs" / "0-mvp"
+        log_dir.mkdir(parents=True)
+        entry = {"timestamp": "2026-04-01T10:00:00+0900", "phase": "0-mvp",
+                 "step": 0, "name": "setup", "status": "completed"}
+        (log_dir / "step0.json").write_text(json.dumps(entry))
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_recent_violations()
+        assert result == ""
+
+    def test_returns_violations_when_present(self, executor, tmp_project):
+        log_dir = tmp_project / "logs" / "0-mvp"
+        log_dir.mkdir(parents=True)
+        entry = {"timestamp": "2026-04-01T10:00:00+0900", "phase": "0-mvp",
+                 "step": 0, "name": "setup", "status": "completed_with_violations",
+                 "violations": "테스트 파일 없음"}
+        (log_dir / "step0.json").write_text(json.dumps(entry))
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_recent_violations()
+        assert "테스트 파일 없음" in result
+        assert "과거 규칙 위반 이력" in result
+
+    def test_limits_to_last_10(self, executor, tmp_project):
+        log_dir = tmp_project / "logs" / "test-phase"
+        log_dir.mkdir(parents=True)
+        for i in range(15):
+            entry = {"timestamp": f"2026-04-{i+1:02d}T10:00:00+0900",
+                     "phase": "test-phase", "step": i, "name": f"s{i}",
+                     "status": "completed_with_violations", "violations": f"위반 {i}"}
+            (log_dir / f"step{i}.json").write_text(json.dumps(entry))
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_recent_violations()
+        lines = [l for l in result.split("\n") if l.startswith("- ")]
+        assert len(lines) == 10
+
+    def test_skips_malformed_log_files(self, executor, tmp_project):
+        log_dir = tmp_project / "logs" / "0-mvp"
+        log_dir.mkdir(parents=True)
+        (log_dir / "step0.json").write_text("not valid json{{{")
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_recent_violations()
+        assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# _move_plan_to_completed
+# ---------------------------------------------------------------------------
+
+class TestMovePlanToCompleted:
+    def _setup_plan(self, tmp_project, content="# Plan"):
+        active = tmp_project / "plans" / "active"
+        active.mkdir(parents=True)
+        completed = tmp_project / "plans" / "completed"
+        completed.mkdir(parents=True)
+        plan_file = active / "0-mvp.md"
+        plan_file.write_text(content)
+        return plan_file
+
+    def test_moves_plan_to_completed(self, executor, tmp_project):
+        plan_file = self._setup_plan(tmp_project)
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+        with patch.object(ex, "ROOT", tmp_project):
+            executor._move_plan_to_completed()
+        assert not plan_file.exists()
+        assert (tmp_project / "plans" / "completed" / "0-mvp.md").exists()
+
+    def test_preserves_plan_content(self, executor, tmp_project):
+        self._setup_plan(tmp_project, content="# Plan: my feature\n\n## 목표\n테스트")
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+        with patch.object(ex, "ROOT", tmp_project):
+            executor._move_plan_to_completed()
+        content = (tmp_project / "plans" / "completed" / "0-mvp.md").read_text()
+        assert "테스트" in content
+
+    def test_noop_when_plan_not_found(self, executor, tmp_project):
+        (tmp_project / "plans" / "active").mkdir(parents=True)
+        git_mock = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+        executor._run_git = git_mock
+        with patch.object(ex, "ROOT", tmp_project):
+            executor._move_plan_to_completed()
+        git_mock.assert_not_called()
+
+    def test_commits_after_move(self, executor, tmp_project):
+        self._setup_plan(tmp_project)
+        git_calls = []
+        def fake_git(*args):
+            git_calls.append(args)
+            if args[0] == "diff":
+                return MagicMock(returncode=1)
+            return MagicMock(returncode=0, stdout="", stderr="")
+        executor._run_git = fake_git
+        with patch.object(ex, "ROOT", tmp_project):
+            executor._move_plan_to_completed()
+        commit_calls = [c for c in git_calls if c[0] == "commit"]
+        assert len(commit_calls) == 1
+        assert "completed" in commit_calls[0][2]
+
+    def test_no_commit_when_nothing_staged(self, executor, tmp_project):
+        self._setup_plan(tmp_project)
+        git_calls = []
+        def fake_git(*args):
+            git_calls.append(args)
+            if args[0] == "diff":
+                return MagicMock(returncode=0)
+            return MagicMock(returncode=0, stdout="", stderr="")
+        executor._run_git = fake_git
+        with patch.object(ex, "ROOT", tmp_project):
+            executor._move_plan_to_completed()
+        commit_calls = [c for c in git_calls if c[0] == "commit"]
+        assert len(commit_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker
+# ---------------------------------------------------------------------------
+
+class TestCircuitBreaker:
+    def _make_executor(self, tmp_project):
+        d = tmp_project / "phases" / "test-cb"
+        d.mkdir(exist_ok=True)
+        index = {"project": "T", "phase": "test",
+                 "steps": [{"step": 0, "name": "setup", "status": "pending"}]}
+        (d / "index.json").write_text(json.dumps(index))
+        (d / "step0.md").write_text("# Step 0\n\n작업하세요.")
+
+        inst = ex.StepExecutor.__new__(ex.StepExecutor)
+        inst._root = str(tmp_project)
+        inst._phases_dir = tmp_project / "phases"
+        inst._phase_dir = d
+        inst._phase_dir_name = "test-cb"
+        inst._index_file = d / "index.json"
+        inst._top_index_file = tmp_project / "phases" / "index.json"
+        inst._phase_name = "test"
+        inst._total = 1
+        inst._project = "T"
+        inst._auto_push = False
+        inst._write_step_log = MagicMock()
+        inst._commit_step = MagicMock()
+        inst._update_top_index = MagicMock()
+        return inst
+
+    def _make_error_invoker(self, inst, error_message):
+        def fake_invoke(step, preamble):
+            index = json.loads(inst._index_file.read_text())
+            for s in index["steps"]:
+                if s["step"] == step["step"]:
+                    s["status"] = "error"
+                    s["error_message"] = error_message
+            inst._index_file.write_text(json.dumps(index))
+            return {"step": 0, "name": "setup", "exitCode": 0, "stdout": "", "stderr": ""}
+        return fake_invoke
+
+    def test_same_error_twice_triggers_circuit_breaker(self, tmp_project):
+        inst = self._make_executor(tmp_project)
+        call_count = {"n": 0}
+
+        def fake_invoke(step, preamble):
+            call_count["n"] += 1
+            index = json.loads(inst._index_file.read_text())
+            for s in index["steps"]:
+                if s["step"] == step["step"]:
+                    s["status"] = "error"
+                    s["error_message"] = "동일한 에러"
+            inst._index_file.write_text(json.dumps(index))
+            return {"step": 0, "name": "setup", "exitCode": 0, "stdout": "", "stderr": ""}
+
+        inst._invoke_claude = fake_invoke
+        with pytest.raises(SystemExit) as exc_info:
+            inst._execute_single_step({"step": 0, "name": "setup", "status": "pending"}, "")
+        assert exc_info.value.code == 1
+        assert call_count["n"] == 2
+
+    def test_circuit_breaker_writes_error_message(self, tmp_project):
+        inst = self._make_executor(tmp_project)
+        inst._invoke_claude = self._make_error_invoker(inst, "반복 에러")
+        with pytest.raises(SystemExit):
+            inst._execute_single_step({"step": 0, "name": "setup", "status": "pending"}, "")
+        data = json.loads(inst._index_file.read_text())
+        step = data["steps"][0]
+        assert step["status"] == "error"
+        assert "circuit breaker" in step["error_message"]
+
+    def test_different_errors_exhaust_all_retries(self, tmp_project):
+        inst = self._make_executor(tmp_project)
+        errors = ["에러 A", "에러 B", "에러 C"]
+        call_count = {"n": 0}
+
+        def fake_invoke(step, preamble):
+            n = call_count["n"]
+            call_count["n"] += 1
+            index = json.loads(inst._index_file.read_text())
+            for s in index["steps"]:
+                if s["step"] == step["step"]:
+                    s["status"] = "error"
+                    s["error_message"] = errors[min(n, len(errors) - 1)]
+            inst._index_file.write_text(json.dumps(index))
+            return {"step": 0, "name": "setup", "exitCode": 0, "stdout": "", "stderr": ""}
+
+        inst._invoke_claude = fake_invoke
+        with pytest.raises(SystemExit) as exc_info:
+            inst._execute_single_step({"step": 0, "name": "setup", "status": "pending"}, "")
+        assert exc_info.value.code == 1
+        assert call_count["n"] == ex.StepExecutor.MAX_RETRIES
+
+
+# ---------------------------------------------------------------------------
+# _unstage_sensitive_files
+# ---------------------------------------------------------------------------
+
+class TestUnstageSensitiveFiles:
+    def test_unstages_env_file(self, executor):
+        reset_calls = []
+        def fake_git(*args):
+            if args[:2] == ("diff", "--cached"):
+                return MagicMock(returncode=0, stdout=".env\nsrc/main.py\n", stderr="")
+            reset_calls.append(args)
+            return MagicMock(returncode=0, stdout="", stderr="")
+        executor._run_git = fake_git
+        executor._unstage_sensitive_files()
+        assert any(".env" in str(c) for c in reset_calls)
+
+    def test_does_not_unstage_normal_files(self, executor):
+        reset_calls = []
+        def fake_git(*args):
+            if args[:2] == ("diff", "--cached"):
+                return MagicMock(returncode=0, stdout="src/main.py\nREADME.md\n", stderr="")
+            reset_calls.append(args)
+            return MagicMock(returncode=0, stdout="", stderr="")
+        executor._run_git = fake_git
+        executor._unstage_sensitive_files()
+        assert len(reset_calls) == 0
+
+    def test_unstages_pem_and_key_files(self, executor):
+        reset_calls = []
+        def fake_git(*args):
+            if args[:2] == ("diff", "--cached"):
+                return MagicMock(returncode=0, stdout="server.pem\napi.key\n", stderr="")
+            reset_calls.append(args)
+            return MagicMock(returncode=0, stdout="", stderr="")
+        executor._run_git = fake_git
+        executor._unstage_sensitive_files()
+        unstaged = [c for c in reset_calls if c[0] == "reset"]
+        assert len(unstaged) == 2
+
+
+# ---------------------------------------------------------------------------
+# _evolve_rules
+# ---------------------------------------------------------------------------
+
+class TestEvolveRules:
+    def _setup(self, tmp_project, violations=None):
+        log_dir = tmp_project / "logs" / "0-mvp"
+        log_dir.mkdir(parents=True)
+        if violations:
+            for i, v in enumerate(violations):
+                entry = {
+                    "timestamp": f"2026-04-{i+1:02d}T10:00:00+0900",
+                    "phase": "0-mvp", "step": i, "name": f"step{i}",
+                    "status": "completed_with_violations", "violations": v,
+                }
+                (log_dir / f"step{i}.json").write_text(json.dumps(entry))
+
+        claude_md = tmp_project / "CLAUDE.md"
+        claude_md.write_text(
+            "# 프로젝트\n\n## CRITICAL 규칙\n- CRITICAL: 기존 규칙\n\n## 명령어\nnpm test\n"
+        )
+        return claude_md
+
+    def test_noop_when_no_log_dir(self, executor, tmp_project):
+        claude_md = tmp_project / "CLAUDE.md"
+        claude_md.write_text("# 프로젝트\n\n## CRITICAL 규칙\n- CRITICAL: 기존 규칙\n")
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+        with patch.object(ex, "ROOT", tmp_project):
+            with patch("subprocess.run") as mock_run:
+                executor._evolve_rules()
+        mock_run.assert_not_called()
+
+    def test_noop_when_no_violations_in_logs(self, executor, tmp_project):
+        log_dir = tmp_project / "logs" / "0-mvp"
+        log_dir.mkdir(parents=True)
+        entry = {"timestamp": "2026-04-01T10:00:00+0900", "phase": "0-mvp",
+                 "step": 0, "name": "setup", "status": "completed"}
+        (log_dir / "step0.json").write_text(json.dumps(entry))
+        (tmp_project / "CLAUDE.md").write_text("# 규칙\n")
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+        with patch.object(ex, "ROOT", tmp_project):
+            with patch("subprocess.run") as mock_run:
+                executor._evolve_rules()
+        mock_run.assert_not_called()
+
+    def test_noop_when_claude_returns_none(self, executor, tmp_project):
+        claude_md = self._setup(tmp_project, violations=["테스트 없이 기능 추가"])
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+        mock_result = MagicMock(returncode=0, stdout="NONE", stderr="")
+        with patch.object(ex, "ROOT", tmp_project):
+            with patch("subprocess.run", return_value=mock_result):
+                executor._evolve_rules()
+        assert claude_md.read_text().count("- CRITICAL:") == 1
+
+    def test_adds_new_rules_to_critical_section(self, executor, tmp_project):
+        claude_md = self._setup(tmp_project, violations=["테스트 없이 기능 추가"])
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+        new_rule = "- CRITICAL: 새 기능 추가 시 반드시 테스트를 먼저 작성하라"
+        mock_result = MagicMock(returncode=0, stdout=new_rule, stderr="")
+        with patch.object(ex, "ROOT", tmp_project):
+            with patch("subprocess.run", return_value=mock_result):
+                executor._evolve_rules()
+        content = claude_md.read_text()
+        assert "새 기능 추가 시 반드시 테스트를 먼저 작성하라" in content
+
+    def test_new_rules_inserted_inside_critical_section(self, executor, tmp_project):
+        claude_md = self._setup(tmp_project, violations=["아키텍처 위반"])
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+        new_rule = "- CRITICAL: 서비스 레이어에서 뷰를 임포트하지 마라"
+        mock_result = MagicMock(returncode=0, stdout=new_rule, stderr="")
+        with patch.object(ex, "ROOT", tmp_project):
+            with patch("subprocess.run", return_value=mock_result):
+                executor._evolve_rules()
+        content = claude_md.read_text()
+        critical_idx = content.index("## CRITICAL 규칙")
+        commands_idx = content.index("## 명령어")
+        new_rule_idx = content.index("서비스 레이어에서")
+        assert critical_idx < new_rule_idx < commands_idx
+
+    def test_commits_when_rules_added(self, executor, tmp_project):
+        self._setup(tmp_project, violations=["위반 발생"])
+        git_calls = []
+        def fake_git(*args):
+            git_calls.append(args)
+            if args[0] == "diff":
+                return MagicMock(returncode=1)
+            return MagicMock(returncode=0, stdout="", stderr="")
+        executor._run_git = fake_git
+        mock_result = MagicMock(returncode=0, stdout="- CRITICAL: 새 규칙", stderr="")
+        with patch.object(ex, "ROOT", tmp_project):
+            with patch("subprocess.run", return_value=mock_result):
+                executor._evolve_rules()
+        commit_calls = [c for c in git_calls if c[0] == "commit"]
+        assert len(commit_calls) == 1
+        assert "evolve" in commit_calls[0][2]
+
+    def test_ignores_non_critical_lines_in_output(self, executor, tmp_project):
+        claude_md = self._setup(tmp_project, violations=["위반"])
+        executor._run_git = MagicMock(return_value=MagicMock(returncode=0, stdout="", stderr=""))
+        noisy_output = "분석 결과:\n- CRITICAL: 실제 규칙\n설명 텍스트"
+        mock_result = MagicMock(returncode=0, stdout=noisy_output, stderr="")
+        with patch.object(ex, "ROOT", tmp_project):
+            with patch("subprocess.run", return_value=mock_result):
+                executor._evolve_rules()
+        content = claude_md.read_text()
+        assert "실제 규칙" in content
+        assert "설명 텍스트" not in content

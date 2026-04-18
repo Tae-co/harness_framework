@@ -10,7 +10,7 @@ Usage:
 import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 LOGS_DIR = ROOT / "logs"
@@ -35,7 +35,7 @@ def _color(text: str, code: str) -> str:
     return f"{code}{text}{RESET}"
 
 
-def _load_logs(phase: Optional[str] = None) -> list[dict]:
+def _load_logs(phase: Optional[str] = None) -> List[dict]:
     if not LOGS_DIR.exists():
         return []
     pattern = f"{phase}/step*.json" if phase else "*/step*.json"
@@ -58,7 +58,7 @@ def _print_summary(entries: list[dict]):
         print("로그가 없습니다. execute.py를 실행하면 자동으로 생성됩니다.")
         return
 
-    phases: dict[str, list[dict]] = {}
+    phases: Dict[str, List[dict]] = {}
     for e in entries:
         phases.setdefault(e.get("phase", "?"), []).append(e)
 

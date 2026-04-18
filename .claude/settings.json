@@ -29,17 +29,6 @@
           }
         ]
       }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('file_path',''))\" 2>/dev/null); if echo \"$FILE\" | grep -qE '\\.(ts|tsx|js|jsx|py|java|kt|swift)$' && ! echo \"$FILE\" | grep -qE '(test|spec|__tests__)'; then BASENAME=$(basename \"$FILE\" | sed 's/\\.[^.]*$//'); DIR=$(dirname \"$FILE\"); if ! find \"$DIR\" -name \"*${BASENAME}*\" | grep -qE '(test|spec|__tests__)'; then echo \"WARN: 테스트 파일이 감지되지 않았습니다 — ${FILE}. TDD 원칙에 따라 테스트를 먼저 작성하세요.\" >&2; fi; fi"
-          }
-        ]
-      }
     ]
   }
 }
